@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""
+LastPass Enterprise API Credential Validator
+Tests LastPass credentials for Elastic LastPass integration
+"""
+
+import requests
+import json
+import sys
+from typing import List, Tuple, Optional
+from datetime import datetime, timedelta
+
+
+class Color:
+    GREEN   = '\033[92m'
+    RED     = '\033[91m'
+    YELLOW  = '\033[93m'
+    BLUE    = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN    = '\033[96m'
+    BOLD    = '\033[1m'
+    END     = '\033[0m'
+
+
+class LastPassValidator:
+    """Validator for LastPass Enterprise API credentials used in Elastic integration"""
+
+    API_URL = "https://lastpass.com/enterpriseapi.php"
+
+    # NOTE: The LastPass API always returns HTTP 200 — even for auth failures.
+    # Success/failure is determined by the "status" field in the JSON response body.
+    # "OK" = success; "AUTHERROR" = bad credentials; "INVALIDCMD" = bad command.
+
+    def __init__(self, account_number: str, provisioning_hash: str):
+        self.account_number    = account_number.strip()
+        self.provisioning_hash = provisioning_hash.strip()
+
+    # -------------------------------------------------------------------------
+    # Output helpers
+    # -------------------------------------------------------------------------
+
+    def print_header(self, text: str):
+        print(f"\n{Color.BOLD}{Color.CYAN}{'='*70}{Color.END}")
+        print(f"{Color.BOLD}{Color.CYAN}{text}{Color.END}")
+        print(f"{Color.BOLD}{Color.CYAN}{'='*70}{Color.END}\n")
+
+    def print_success(self, text: str):
+        print(f"{Color.GREEN}✓ {text}{Color.END}")
+
+    def print_error(self, text: str):
+        print(f"{Color.RED}✗ {text}{Color.END}")
+
+    def print_warning(self, text: str):
+        print(f"{Color.YELLOW}⚠ {text}{Color.END}")
+
+    def print_info(self, text: str):
+        print(f"{Color.BLUE}  {text}{Color.END}")
+
+    # -------------------------------------------------------------------------
+    # Core API helper
+    # -------------------------------------------------------------------------
+
+    def _post(self, cmd: str, data: dict = None) -> Tuple[bool, Optional[dict], str]:
+        """
+        POST a command to the LastPass Enterprise API.
+
+        IMPORTANT: The API always responds HTTP 200 — even for bad credentials.
+        Callers must inspect the returned 'status' field:
+          "OK"         = success
+          "AUTHERROR"  = bad account number or provisioning hash
+          "INVALIDCMD" = command name is wrong
+          (other)      = API-level error
+
+        Returns (success, response_dict, message).
+        """
+        payload = {
+            "cid":      self.account_number,
+            "provhash": self.provisioning_hash,
+            "cmd":      cmd,
+        }
+        if data:
+            payload["data"] = data
+
+        try:
+            r = requests.post(
+                self.API_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+
+            # HTTP-level errors (not expected from LastPass, but handle defensively)
+            if r.status_code != 200:
+                return (False, None, f"Unexpected HTTP {r.status_code}: {r.text[:200]}")
+
+            try:
+                body = r.json()
+            except json.JSONDecodeError:
+                return (False, None, f"Response is not valid JSON: {r.text[:200]}")
+
+            status = body.get("status", "").upper()
+
+            if status == "OK":
+                return (True, body, "OK")
+            elif status == "AUTHERROR":
+                error_msg = body.get("error", "Authentication failed")
+                return (False, body, f"AUTHERROR — {error_msg}")
+            elif status == "INVALIDCMD":
+                return (False, body, f"INVALIDCMD — command '{cmd}' is not valid")
+            else:
+                error_msg = body.get("error", f"Unexpected status: {status}")
+                return (False, body, error_msg)
+
+        except requests.exceptions.Timeout:
+            return (False, None, "Request timed out — check network connectivity")
+        except requests.exceptions.ConnectionError:
+            return (False, None, "Cannot reach lastpass.com — check internet connectivity")
+        except Exception as e:
+            return (False, None, f"Unexpected error: {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # Test 1: Input format validation
+    # -------------------------------------------------------------------------
+
+    def validate_input(self) -> Tuple[bool, List[str]]:
+        errors = []
+
+        if not self.account_number:
+            errors.append("Account Number is empty")
+        elif not self.account_number.isdigit():
+            errors.append(
+                "Account Number should be numeric (e.g., 1234567).\n"
+                "  Find it at: LastPass Admin Console → Dashboard → 'Account number' at the top of the page"
+            )
+
+        if not self.provisioning_hash:
+            errors.append("Provisioning Hash is empty")
+        elif len(self.provisioning_hash) < 20:
+            errors.append(
+                "Provisioning Hash appears too short.\n"
+                "  Find it at: LastPass Admin Console → Advanced → Enterprise API → copy the hash"
+            )
+
+        return (len(errors) == 0, errors)
+
+    # -------------------------------------------------------------------------
+    # Test 2: Authentication
+    # -------------------------------------------------------------------------
+
+    def test_authentication(self) -> Tuple[bool, str, Optional[int]]:
+        """
+        Verify credentials using a minimal getuserdata call (pagesize=1).
+        Returns (success, message, total_user_count_or_None).
+        """
+        self.print_info(f"Account Number:    {self.account_number}")
+        self.print_info(f"API endpoint:      {self.API_URL}")
+
+        success, body, msg = self._post("getuserdata", {"pagesize": 1, "pageindex": 0})
+
+        if success:
+            # Count all users across Users + Users_Deleted (informational)
+            users         = body.get("Users", {})
+            users_deleted = body.get("Users_Deleted", {})
+            total = len(users) + len(users_deleted)
+            return (True, "Credentials accepted — authentication successful", total if total > 0 else None)
+        else:
+            if "AUTHERROR" in msg:
+                return (False,
+                    "Authentication failed — account number or provisioning hash is incorrect.\n"
+                    "  • Verify the Account Number from: Admin Console → Dashboard tab → top of page\n"
+                    "  • Verify the Provisioning Hash from: Admin Console → Advanced → Enterprise API\n"
+                    "  • The hash may have been regenerated — if so, a new hash was issued and the old one is invalid",
+                    None
+                )
+            return (False, msg, None)
+
+    # -------------------------------------------------------------------------
+    # Test 3: Event Report (audit logs — primary Elastic data stream)
+    # -------------------------------------------------------------------------
+
+    def test_event_report(self) -> Tuple[bool, str, int]:
+        """
+        Test access to audit event logs using the 'reporting' command.
+        Queries the last 24 hours. This is the primary Elastic data stream.
+        """
+        now  = datetime.utcnow()
+        from_dt = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        to_dt   = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        self.print_info(f"Querying audit events from {from_dt} UTC to {to_dt} UTC")
+
+        success, body, msg = self._post("reporting", {
+            "from":      from_dt,
+            "to":        to_dt,
+            "tz_offset": 0,
+        })
+
+        if success:
+            events = body.get("events", [])
+            count  = len(events)
+            if count > 0:
+                return (True, f"Accessible — {count} event(s) found in the last 24 hours", count)
+            else:
+                return (True, "Accessible — no events in last 24 hours (normal for low-activity tenants)", 0)
+        else:
+            return (False, msg, 0)
+
+    # -------------------------------------------------------------------------
+    # Test 4: User data
+    # -------------------------------------------------------------------------
+
+    def test_user_data(self) -> Tuple[bool, str, int]:
+        """
+        Test access to the user directory using the 'getuserdata' command.
+        Elastic uses this to build user context alongside audit events.
+        """
+        success, body, msg = self._post("getuserdata", {"pagesize": 10, "pageindex": 0})
+
+        if success:
+            users         = body.get("Users", {})
+            users_deleted = body.get("Users_Deleted", {})
+            groups        = body.get("Groups", {})
+            active_count  = len(users)
+            group_count   = len(groups)
+            detail = f"{active_count} active user(s)"
+            if group_count:
+                detail += f", {group_count} group(s)"
+            return (True, f"Accessible — {detail} found", active_count)
+        else:
+            return (False, msg, 0)
+
+    # -------------------------------------------------------------------------
+    # Test 5: Detailed shared folder data
+    # -------------------------------------------------------------------------
+
+    def test_shared_folders(self) -> Tuple[bool, str, int]:
+        """
+        Test access to shared folder data using the 'getdetailedsfdata' command.
+        Elastic uses this for the detailed_shared_folder data stream.
+        """
+        success, body, msg = self._post("getdetailedsfdata", {
+            "data":      "all",
+            "pagesize":  10,
+            "pageindex": 0,
+        })
+
+        if success:
+            folders = body.get("SharedFolders", {})
+            count   = len(folders)
+            if count > 0:
+                return (True, f"Accessible — {count} shared folder(s) found", count)
+            else:
+                return (True, "Accessible — no shared folders configured in this account", 0)
+        else:
+            return (False, msg, 0)
+
+    # -------------------------------------------------------------------------
+    # Orchestrator
+    # -------------------------------------------------------------------------
+
+    def run_validation(self) -> bool:
+        self.print_header("LastPass Enterprise API Credential Validator")
+        print(f"Account Number: {self.account_number}")
+        print(f"Testing at:     {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+
+        # Test 1: Input format
+        self.print_header("Test 1: Credential Format Validation")
+        is_valid, errors = self.validate_input()
+        if is_valid:
+            self.print_success("Credential format is valid")
+        else:
+            self.print_error("Credential format validation failed:")
+            for err in errors:
+                print(f"  • {err}")
+            return False
+
+        # Test 2: Authentication
+        self.print_header("Test 2: API Authentication")
+        success, msg, user_count = self.test_authentication()
+        if success:
+            self.print_success(msg)
+            if user_count:
+                self.print_info(f"User directory is accessible ({user_count} user(s) visible)")
+            auth_ok = True
+        else:
+            self.print_error(msg)
+            auth_ok = False
+            print(f"\n{Color.RED}{Color.BOLD}STATUS: NOT READY - FIX REQUIRED{Color.END}\n")
+            return False
+
+        # Test 3: Event Report (audit logs)
+        self.print_header("Test 3: Event Report Access (Audit Logs)")
+        print("This is the primary Elastic data stream — security and audit events.\n")
+        success, msg, event_count = self.test_event_report()
+        if success:
+            self.print_success(msg)
+            events_ok = True
+        else:
+            self.print_error(msg)
+            print("\nCommon fixes:")
+            print("  • Confirm the account has LastPass Business (not Teams)")
+            print("  • Verify the provisioning hash has not been rotated since it was provided")
+            events_ok = False
+
+        # Test 4: User data
+        self.print_header("Test 4: User Data Access")
+        print("Elastic uses this to enrich events with user context.\n")
+        success, msg, _ = self.test_user_data()
+        if success:
+            self.print_success(msg)
+            users_ok = True
+        else:
+            self.print_error(msg)
+            users_ok = False
+
+        # Test 5: Detailed shared folders
+        self.print_header("Test 5: Detailed Shared Folder Access")
+        print("Elastic uses this for shared vault visibility (optional but recommended).\n")
+        success, msg, folder_count = self.test_shared_folders()
+        if success:
+            self.print_success(msg)
+            if folder_count == 0:
+                self.print_info("No shared folders found — this is fine if none have been created")
+            folders_ok = True
+        else:
+            self.print_error(msg)
+            print("\nNote: getdetailedsfdata requires LastPass Business and at least one shared folder.")
+            folders_ok = False
+
+        # Summary
+        self.print_header("Validation Summary")
+
+        results = [
+            ("Event Report (Audit Logs)", events_ok, True),
+            ("User Data",                 users_ok,  True),
+            ("Detailed Shared Folders",   folders_ok, False),
+        ]
+
+        for name, ok, required in results:
+            if required:
+                icon = f"{Color.GREEN}✓ PASS{Color.END}" if ok else f"{Color.RED}✗ FAIL{Color.END}"
+            else:
+                icon = f"{Color.GREEN}✓ PASS{Color.END}" if ok else f"{Color.YELLOW}⚠ WARN{Color.END}"
+            tag = "" if required else " (optional)"
+            print(f"  {icon}  {name}{tag}")
+
+        print()
+
+        required_ok = events_ok and users_ok
+
+        if required_ok:
+            self.print_success("All required data streams are accessible")
+            if not folders_ok:
+                self.print_warning(
+                    "Shared folder data stream failed — Elastic will still ingest events and user data.\n"
+                    "  This is expected if no shared folders exist in the account."
+                )
+
+            print(f"\n{Color.BOLD}Use these values in Elastic:{Color.END}")
+            print(f"  URL:              {self.API_URL}")
+            print(f"  Account Number:   {self.account_number}")
+            print(f"  Provisioning Hash: [as provided]")
+            print()
+            self.print_info("Note: Rotating the provisioning hash in LastPass Admin Console will immediately")
+            self.print_info("break the Elastic integration — coordinate with the client before any rotation.")
+            print(f"\n{Color.GREEN}{Color.BOLD}STATUS: READY FOR ELASTIC INTEGRATION{Color.END}\n")
+            return True
+        else:
+            self.print_error("One or more required data streams failed — fix before integrating")
+            print(f"\n{Color.RED}{Color.BOLD}STATUS: NOT READY - FIX REQUIRED{Color.END}\n")
+            return False
+
+
+def main():
+    print(f"{Color.BOLD}{Color.MAGENTA}")
+    print("╔════════════════════════════════════════════════════════════════════╗")
+    print("║     LastPass Enterprise API Credential Validator                  ║")
+    print("║     For Elastic LastPass Integration                              ║")
+    print("╚════════════════════════════════════════════════════════════════════╝")
+    print(Color.END)
+
+    print(f"\n{Color.BOLD}Enter LastPass Enterprise credentials:{Color.END}\n")
+    print("  Account Number:    Admin Console → Dashboard → 'Account number' at top of page")
+    print("  Provisioning Hash: Admin Console → Advanced → Enterprise API\n")
+
+    account_number    = input("Account Number:    ").strip()
+    provisioning_hash = input("Provisioning Hash: ").strip()
+
+    validator = LastPassValidator(account_number, provisioning_hash)
+    success = validator.run_validation()
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
