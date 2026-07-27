@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+Cisco Duo Admin API Credential Validator
+Tests Duo Admin API credentials for the Elastic Cisco Duo integration.
+
+Validates access to the 5 Duo Admin API datasets Elastic ingests:
+    admin, auth, offline_enrollment, summary, telephony
+
+Credentials come from: Duo Admin Panel -> Applications -> Admin API application
+(Applications -> Protect an Application -> search "Admin API" if none exists yet)
+
+Required permission on that application: "Grant read log"
+"""
+
+import base64
+import hashlib
+import hmac
+import sys
+import unicodedata
+import urllib.parse
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Dict, List, Optional, Tuple
+
+import requests
+
+# Force UTF-8 stdout/stderr so ✓/✗/⚠ and box-drawing chars don't crash on
+# Windows consoles running a non-UTF-8 codepage, or when output is piped/redirected.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+class Color:
+    GREEN   = '\033[92m'
+    RED     = '\033[91m'
+    YELLOW  = '\033[93m'
+    BLUE    = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN    = '\033[96m'
+    BOLD    = '\033[1m'
+    END     = '\033[0m'
+
+
+# ---------------------------------------------------------------------------
+# Duo request signing (HMAC-SHA1) — no duo_client SDK required
+# ---------------------------------------------------------------------------
+
+_WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+
+def _rfc2822_date(dt: datetime) -> str:
+    """Locale-independent RFC 2822 date string, as required by Duo's signing spec."""
+    return (f"{_WEEKDAYS[dt.weekday()]}, {dt.day:02d} {_MONTHS[dt.month - 1]} {dt.year} "
+            f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d} -0000")
+
+
+def _canon_params(params: dict) -> str:
+    args = []
+    for k in sorted(params.keys()):
+        args.append('%s=%s' % (
+            urllib.parse.quote(str(k), safe='~'),
+            urllib.parse.quote(str(params[k]), safe='~'),
+        ))
+    return '&'.join(args)
+
+
+def _sign(method: str, host: str, path: str, params: dict, date: str, skey: str) -> str:
+    canon = '\n'.join([date, method.upper(), host.lower(), path, _canon_params(params)])
+    return hmac.new(skey.encode('utf-8'), canon.encode('utf-8'), hashlib.sha1).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Input inspection
+# ---------------------------------------------------------------------------
+
+def _inspect_hidden_chars(value: str, name: str) -> List[str]:
+    """Flag control characters and non-ASCII that cause invisible corruption."""
+    problems = []
+    labels = {0x09: "TAB", 0x0A: "LF/newline", 0x0D: "CR", 0x1B: "ESC"}
+    for idx, ch in enumerate(value):
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F:
+            label = labels.get(code, f"control-0x{code:02X}")
+            problems.append(
+                f"{name} has a hidden {label} character at position {idx} — "
+                "re-copy directly from the Duo Admin Panel, not from email or Slack"
+            )
+        elif code > 0x7E:
+            uname = unicodedata.name(ch, f"U+{code:04X}")
+            problems.append(
+                f"{name} has non-ASCII character '{ch}' ({uname}) at position {idx} — "
+                "re-copy from the source"
+            )
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# Validator
+# ---------------------------------------------------------------------------
+
+class DuoValidator:
+    """
+    Validates Duo Admin API credentials for the Elastic Cisco Duo integration.
+
+    Elastic's Cisco Duo integration ingests 5 datasets, each backed by a
+    distinct Admin API endpoint:
+        admin               -> GET /admin/v1/logs/administrator
+        auth                -> GET /admin/v2/logs/authentication
+        offline_enrollment  -> GET /admin/v1/logs/offline_enrollment
+        summary             -> GET /admin/v1/info/summary
+        telephony           -> GET /admin/v1/logs/telephony
+
+    All 5 require the "Grant read log" permission on the Admin API
+    application in the Duo Admin Panel.
+    """
+
+    DATASETS = [
+        ("admin",              "/admin/v1/logs/administrator",     "mintime"),
+        ("auth",                "/admin/v2/logs/authentication",    "v2auth"),
+        ("offline_enrollment",  "/admin/v1/logs/offline_enrollment", "mintime"),
+        ("summary",             "/admin/v1/info/summary",           "none"),
+        ("telephony",           "/admin/v1/logs/telephony",         "mintime"),
+    ]
+
+    def __init__(self, ikey: str, skey: str, api_host: str):
+        self._raw_ikey = ikey
+        self._raw_skey = skey
+        self._raw_host = api_host
+
+        self.ikey = ikey.strip()
+        self.skey = skey.strip()
+
+        host = api_host.strip().lower()
+        host = host.replace("https://", "").replace("http://", "").rstrip("/")
+        self.api_host = host
+
+        self.working_datasets: List[str] = []
+        self.missing_datasets: List[Tuple[str, str]] = []
+        self._clock_skew_warned = False
+
+    # ------------------------------------------------------------------
+    # Output helpers
+    # ------------------------------------------------------------------
+
+    def _header(self, text: str):
+        print(f"\n{Color.BOLD}{Color.CYAN}{'='*70}{Color.END}")
+        print(f"{Color.BOLD}{Color.CYAN}{text}{Color.END}")
+        print(f"{Color.BOLD}{Color.CYAN}{'='*70}{Color.END}\n")
+
+    def _ok(self, t: str):   print(f"{Color.GREEN}✓ {t}{Color.END}")
+    def _err(self, t: str):  print(f"{Color.RED}✗ {t}{Color.END}")
+    def _warn(self, t: str): print(f"{Color.YELLOW}⚠ {t}{Color.END}")
+    def _info(self, t: str): print(f"{Color.BLUE}  {t}{Color.END}")
+
+    # ------------------------------------------------------------------
+    # Test 1 — format + hidden-character forensics
+    # ------------------------------------------------------------------
+
+    def validate_input(self) -> Tuple[bool, List[str], List[str]]:
+        """Returns (all_ok, errors, warnings)."""
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        # --- Integration Key ---
+        if not self.ikey:
+            errors.append("Integration Key (ikey) is empty")
+        else:
+            errors.extend(_inspect_hidden_chars(self.ikey, "Integration Key"))
+            if len(self.ikey) != 20:
+                warnings.append(
+                    f"Integration Key is {len(self.ikey)} chars — Duo ikeys are normally exactly 20 chars."
+                )
+            if not self.ikey.startswith("DI"):
+                warnings.append(
+                    "Integration Key normally starts with 'DI' — verify you copied the "
+                    "Integration Key field, not the Secret Key."
+                )
+
+        # --- Secret Key ---
+        if not self.skey:
+            errors.append("Secret Key (skey) is empty")
+        else:
+            errors.extend(_inspect_hidden_chars(self.skey, "Secret Key"))
+            if len(self.skey) != 40:
+                warnings.append(
+                    f"Secret Key is {len(self.skey)} chars — Duo skeys are normally exactly 40 chars."
+                )
+            if self.skey.startswith('"') or self.skey.endswith('"') or \
+               self.skey.startswith("'") or self.skey.endswith("'"):
+                errors.append("Secret Key has surrounding quotes — remove them.")
+
+        # --- API Hostname ---
+        if not self.api_host:
+            errors.append("API Hostname is empty")
+        else:
+            errors.extend(_inspect_hidden_chars(self.api_host, "API Hostname"))
+            if not (self.api_host.endswith("duosecurity.com") or self.api_host.endswith("duofederal.com")):
+                warnings.append(
+                    f"API Hostname '{self.api_host}' does not end in duosecurity.com or "
+                    "duofederal.com — verify it was copied from the Admin API application's "
+                    "details page (not the login/admin panel URL)."
+                )
+            if not self.api_host.startswith("api-"):
+                warnings.append(
+                    "API Hostname normally starts with 'api-' — verify this is the API "
+                    "hostname shown on the Admin API application page."
+                )
+
+        # Whitespace-stripped notices
+        if self._raw_ikey != self.ikey:
+            warnings.append("Integration Key had leading/trailing whitespace — auto-stripped.")
+        if self._raw_skey != self.skey:
+            warnings.append("Secret Key had leading/trailing whitespace — auto-stripped.")
+
+        return (len(errors) == 0, errors, warnings)
+
+    # ------------------------------------------------------------------
+    # Signed request core
+    # ------------------------------------------------------------------
+
+    def _check_clock_skew(self, response: requests.Response, local_now: datetime):
+        if self._clock_skew_warned:
+            return
+        remote_date = response.headers.get("Date")
+        if not remote_date:
+            return
+        try:
+            remote_dt = parsedate_to_datetime(remote_date)
+            if remote_dt.tzinfo is None:
+                remote_dt = remote_dt.replace(tzinfo=timezone.utc)
+            drift = abs((remote_dt - local_now).total_seconds())
+            if drift > 180:
+                self._warn(
+                    f"System clock is ~{int(drift)}s off from Duo's server time. Duo rejects "
+                    "signed requests when the Date header drifts more than ~5 minutes — sync "
+                    "this machine's clock (NTP) if you see signature errors."
+                )
+                self._clock_skew_warned = True
+        except Exception:
+            pass
+
+    def _signed_request(self, path: str, params: dict) -> Tuple[bool, Optional[dict], str]:
+        """
+        Perform a signed GET request against the Duo Admin API.
+
+        Returns (success, response_payload, message).
+        """
+        now = datetime.now(timezone.utc)
+        date = _rfc2822_date(now)
+        signature = _sign("GET", self.api_host, path, params, date, self.skey)
+        auth = base64.b64encode(f"{self.ikey}:{signature}".encode()).decode()
+
+        headers = {"Date": date, "Authorization": f"Basic {auth}", "Host": self.api_host}
+        url = f"https://{self.api_host}{path}"
+
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+        except requests.exceptions.Timeout:
+            return (False, None, f"Timed out reaching {self.api_host}")
+        except requests.exceptions.ConnectionError:
+            return (False, None, f"Cannot reach {self.api_host} — check hostname/network/firewall")
+        except Exception as e:
+            return (False, None, f"Unexpected error: {e}")
+
+        self._check_clock_skew(r, now)
+
+        try:
+            data = r.json()
+        except ValueError:
+            return (False, None, f"HTTP {r.status_code} — non-JSON response: {r.text[:200]}")
+
+        if data.get("stat") == "OK":
+            return (True, data.get("response"), "OK")
+
+        code = data.get("code", r.status_code)
+        msg = data.get("message", "Unknown error")
+        detail = data.get("message_detail", "")
+        full = f"[{code}] {msg}" + (f" — {detail}" if detail else "")
+        return (False, None, full)
+
+    @staticmethod
+    def _diagnose(message: str) -> Optional[str]:
+        """Map a Duo error message to a plain-English likely cause."""
+        m = message.lower()
+        if "integration key" in m or "invalid identity" in m:
+            return "Integration Key does not exist for this API host — verify the ikey and that it belongs to this Admin API application."
+        if "signature" in m:
+            return "Signature invalid — usually a wrong/corrupted Secret Key, a wrong API Hostname (signing must use the exact host), or clock skew (see above)."
+        if "forbidden" in m or "not authorized" in m or "permission" in m:
+            return "Access forbidden — the Admin API application is missing the 'Grant read log' permission (Duo Admin Panel -> Applications -> this Admin API app -> Permissions)."
+        if "not found" in m or "404" in m:
+            return "Endpoint not found — verify the API Hostname is correct for this Duo account/region."
+        if "too many requests" in m or "rate limit" in m:
+            return "Rate limited by Duo — credentials are likely fine, just retry after a short wait."
+        return None
+
+    # ------------------------------------------------------------------
+    # Per-dataset test
+    # ------------------------------------------------------------------
+
+    def test_dataset(self, path: str, time_mode: str) -> Tuple[bool, str]:
+        now_s = int(datetime.now(timezone.utc).timestamp())
+        if time_mode == "mintime":
+            params = {"mintime": now_s - 300}
+        elif time_mode == "v2auth":
+            params = {"mintime": (now_s - 300) * 1000, "maxtime": now_s * 1000, "limit": 1}
+        else:
+            params = {}
+
+        ok, _resp, msg = self._signed_request(path, params)
+        return (ok, msg)
+
+    # ------------------------------------------------------------------
+    # Orchestrator
+    # ------------------------------------------------------------------
+
+    def run_validation(self) -> bool:
+        self._header("Cisco Duo Admin API Credential Validator")
+        print(f"Integration Key:  {self.ikey}")
+        print(f"Secret Key:       {'*' * 8}... ({len(self.skey)} chars)")
+        print(f"API Hostname:     {self.api_host}")
+        print(f"Testing at:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Test 1: format
+        self._header("Test 1: Input Format & Hidden-Character Inspection")
+        is_valid, errors, warnings = self.validate_input()
+
+        for w in warnings:
+            self._warn(w)
+        if is_valid:
+            self._ok("No format issues detected")
+        else:
+            self._err("Format issues found:")
+            for e in errors:
+                for line in e.split("\n"):
+                    print(f"  • {line}")
+            self._header("Validation Summary")
+            self._err("Cannot proceed — fix format issues above")
+            print(f"\n{Color.RED}{Color.BOLD}STATUS: NOT READY - FIX REQUIRED{Color.END}\n")
+            return False
+
+        # Test 2: connectivity + auth via lightest endpoint (also the 'summary' dataset)
+        self._header("Test 2: Authentication & API Connectivity (summary endpoint)")
+        ok, msg = self.test_dataset("/admin/v1/info/summary", "none")
+        if ok:
+            self._ok("Signed request accepted — Integration Key and Secret Key are valid")
+            self.working_datasets.append("summary")
+        else:
+            self._err(f"Authentication failed: {msg}")
+            cause = self._diagnose(msg)
+            if cause:
+                self._info(f"Likely cause: {cause}")
+            self.missing_datasets.append(("summary", msg))
+            self._header("Validation Summary")
+            self._err("Cannot proceed — fix authentication before checking dataset permissions")
+            print(f"\n{Color.RED}{Color.BOLD}STATUS: NOT READY - FIX REQUIRED{Color.END}\n")
+            return False
+
+        # Test 3: remaining datasets
+        self._header("Test 3: Dataset Access (Elastic Cisco Duo integration)")
+        print("Checking access to each log dataset Elastic will ingest...\n")
+
+        for name, path, time_mode in self.DATASETS:
+            if name == "summary":
+                self._ok(f"{name:20} Available")
+                continue
+            ok, msg = self.test_dataset(path, time_mode)
+            if ok:
+                self._ok(f"{name:20} Available")
+                self.working_datasets.append(name)
+            else:
+                self._warn(f"{name:20} {msg}")
+                self.missing_datasets.append((name, msg))
+
+        # Summary
+        self._header("Validation Summary")
+
+        print(f"{Color.BOLD}Working Datasets ({len(self.working_datasets)}/5):{Color.END}")
+        for name, _path, _tm in self.DATASETS:
+            if name in self.working_datasets:
+                print(f"  {Color.GREEN}✓{Color.END} {name}")
+        if not self.working_datasets:
+            print(f"  {Color.RED}None{Color.END}")
+
+        print(f"\n{Color.BOLD}Unavailable Datasets ({len(self.missing_datasets)}):{Color.END}")
+        if self.missing_datasets:
+            for name, msg in self.missing_datasets:
+                print(f"  {Color.YELLOW}⚠{Color.END} {name}: {msg}")
+                cause = self._diagnose(msg)
+                if cause:
+                    self._info(f"    → {cause}")
+        else:
+            print(f"  {Color.GREEN}All datasets available!{Color.END}")
+
+        print()
+        if len(self.working_datasets) == 5:
+            self._ok("✓ Credentials are VALID")
+            self._ok("✓ All 5 datasets accessible — full Elastic Cisco Duo integration coverage")
+            print(f"\n{Color.GREEN}{Color.BOLD}STATUS: READY FOR ELASTIC INTEGRATION{Color.END}\n")
+            return True
+        elif self.working_datasets:
+            self._warn(f"Partial access — {len(self.working_datasets)}/5 datasets available")
+            self._info("If any dataset shows 'Access forbidden', enable 'Grant read log' on the "
+                        "Admin API application in the Duo Admin Panel and re-run this script.")
+            print(f"\n{Color.YELLOW}{Color.BOLD}STATUS: PARTIAL - REVIEW PERMISSIONS{Color.END}\n")
+            return False
+        else:
+            self._err("✗ NO DATASETS AVAILABLE")
+            print(f"\n{Color.RED}{Color.BOLD}STATUS: NOT READY - FIX REQUIRED{Color.END}\n")
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    print(f"{Color.BOLD}{Color.MAGENTA}")
+    print("╔════════════════════════════════════════════════════════════════════╗")
+    print("║     Cisco Duo Admin API Credential Validator                      ║")
+    print("║     For Elastic Cisco Duo Integration                             ║")
+    print("╚════════════════════════════════════════════════════════════════════╝")
+    print(Color.END)
+
+    print(f"\n{Color.BOLD}Credentials to enter:{Color.END}")
+    print("  Source: Duo Admin Panel -> Applications -> Admin API application")
+    print("  (Applications -> Protect an Application -> search 'Admin API' if none exists)")
+    print("  Required permission: 'Grant read log'")
+    print()
+    print(f"  {Color.YELLOW}Paste directly from the Duo Admin Panel — NOT from email, Slack, or Teams.{Color.END}")
+    print()
+
+    ikey = input("Integration Key (ikey): ").strip()
+    skey = input("Secret Key (skey):      ").strip()
+    api_host = input("API Hostname:            ").strip()
+
+    validator = DuoValidator(ikey=ikey, skey=skey, api_host=api_host)
+    success = validator.run_validation()
+
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
