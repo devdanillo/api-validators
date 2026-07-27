@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""
+Darktrace API Credential Validator
+Tests Darktrace credentials for Elastic Darktrace integration
+"""
+
+import hmac
+import hashlib
+import json
+import requests
+import sys
+from typing import List, Tuple, Optional
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
+
+
+class Color:
+    GREEN   = '\033[92m'
+    RED     = '\033[91m'
+    YELLOW  = '\033[93m'
+    BLUE    = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN    = '\033[96m'
+    BOLD    = '\033[1m'
+    END     = '\033[0m'
+
+
+class DarktraceValidator:
+    """Validator for Darktrace API credentials used in Elastic integration"""
+
+    # Authentication uses HMAC-SHA1 with three custom request headers.
+    # Every request must be signed — there is no session token or OAuth flow.
+    #
+    # Signing string: "{path}?{sorted_query_string}\n{public_token}\n{timestamp}"
+    # CRITICAL: Query parameters MUST be sorted alphabetically before signing.
+    # The request must also send them in that same order or the signature will not match.
+
+    def __init__(
+        self,
+        base_url:      str,
+        public_token:  str,
+        private_token: str,
+        verify_ssl:    bool = True,
+    ):
+        self.base_url      = base_url.rstrip("/")
+        self.public_token  = public_token.strip()
+        self.private_token = private_token.strip()
+        self.verify_ssl    = verify_ssl
+
+    # -------------------------------------------------------------------------
+    # Output helpers
+    # -------------------------------------------------------------------------
+
+    def print_header(self, text: str):
+        print(f"\n{Color.BOLD}{Color.CYAN}{'='*70}{Color.END}")
+        print(f"{Color.BOLD}{Color.CYAN}{text}{Color.END}")
+        print(f"{Color.BOLD}{Color.CYAN}{'='*70}{Color.END}\n")
+
+    def print_success(self, text: str):
+        print(f"{Color.GREEN}✓ {text}{Color.END}")
+
+    def print_error(self, text: str):
+        print(f"{Color.RED}✗ {text}{Color.END}")
+
+    def print_warning(self, text: str):
+        print(f"{Color.YELLOW}⚠ {text}{Color.END}")
+
+    def print_info(self, text: str):
+        print(f"{Color.BLUE}  {text}{Color.END}")
+
+    # -------------------------------------------------------------------------
+    # HMAC-SHA1 signing
+    # -------------------------------------------------------------------------
+
+    def _build_headers(self, path: str, params: dict = None) -> Tuple[dict, list]:
+        """
+        Build HMAC-SHA1 signed headers for a Darktrace API request.
+
+        Returns (headers_dict, sorted_params_list).
+        The sorted_params_list must be forwarded to requests as-is so the
+        URL's query string matches exactly what was signed.
+        """
+        if params is None:
+            params = {}
+
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+        # Sort alphabetically — mandatory; any mismatch produces a 400 auth error
+        sorted_params = sorted(params.items())
+        query_string  = urlencode(sorted_params)
+
+        sign_string = f"{path}?{query_string}\n{self.public_token}\n{date_str}"
+
+        signature = hmac.new(
+            self.private_token.encode("ASCII"),
+            sign_string.encode("ASCII"),
+            hashlib.sha1,
+        ).hexdigest()
+
+        headers = {
+            "DTAPI-Token":     self.public_token,
+            "DTAPI-Date":      date_str,
+            "DTAPI-Signature": signature,
+        }
+        return headers, sorted_params
+
+    def _get(self, path: str, params: dict = None) -> Tuple[bool, Optional[any], str]:
+        """
+        Authenticated GET to the Darktrace API.
+        Returns (success, response_data, message).
+        """
+        headers, sorted_params = self._build_headers(path, params)
+        url = f"{self.base_url}{path}"
+
+        try:
+            r = requests.get(
+                url,
+                params=sorted_params,   # Must match the signed order
+                headers=headers,
+                timeout=30,
+                verify=self.verify_ssl,
+            )
+
+            if r.status_code == 200:
+                try:
+                    return (True, r.json(), "OK")
+                except json.JSONDecodeError:
+                    return (True, r.text, "OK")
+            elif r.status_code in (400, 401):
+                try:
+                    detail = r.json().get("error", r.text[:200])
+                except Exception:
+                    detail = r.text[:200]
+                return (False, None, f"Authentication error ({r.status_code}): {detail}")
+            elif r.status_code == 403:
+                return (False, None, "Forbidden — token lacks permission for this endpoint")
+            elif r.status_code == 404:
+                return (False, None, "Endpoint not found — verify the appliance URL is correct")
+            else:
+                return (False, None, f"Unexpected HTTP {r.status_code}: {r.text[:200]}")
+
+        except requests.exceptions.SSLError as e:
+            return (False, None,
+                "SSL certificate error — the appliance may use a self-signed certificate.\n"
+                "  Re-run the script and answer 'y' to 'Skip SSL verification?'\n"
+                f"  SSL detail: {str(e)[:150]}"
+            )
+        except requests.exceptions.Timeout:
+            return (False, None,
+                "Request timed out — verify the appliance URL and network path.\n"
+                "  For on-prem appliances, confirm VPN or firewall access."
+            )
+        except requests.exceptions.ConnectionError:
+            return (False, None,
+                f"Cannot connect to {self.base_url}\n"
+                "  • Verify the URL includes the correct scheme (https://)\n"
+                "  • Confirm the appliance is reachable from this machine\n"
+                "  • For on-prem appliances, check VPN/firewall rules"
+            )
+        except Exception as e:
+            return (False, None, f"Unexpected error: {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # Test 1: Input format validation
+    # -------------------------------------------------------------------------
+
+    def validate_input(self) -> Tuple[bool, List[str]]:
+        errors = []
+
+        if not self.base_url:
+            errors.append("Appliance URL is empty")
+        elif not self.base_url.startswith(("http://", "https://")):
+            errors.append(
+                "Appliance URL must start with http:// or https://\n"
+                "  Example: https://192.168.1.100  or  https://yourcompany.cloud.darktrace.com"
+            )
+
+        if not self.public_token:
+            errors.append("Public Token is empty")
+        elif len(self.public_token) < 10:
+            errors.append("Public Token appears too short")
+
+        if not self.private_token:
+            errors.append("Private Token is empty")
+        elif len(self.private_token) < 10:
+            errors.append(
+                "Private Token appears too short.\n"
+                "  Note: The private token is displayed only once at creation and cannot be recovered.\n"
+                "  If lost, a new token pair must be generated at:\n"
+                "  Threat Visualizer → Admin → System Config → API Token"
+            )
+
+        return (len(errors) == 0, errors)
+
+    # -------------------------------------------------------------------------
+    # Test 2: Connectivity + authentication via /status
+    # -------------------------------------------------------------------------
+
+    def test_connectivity(self) -> Tuple[bool, str]:
+        """
+        Verify connectivity and HMAC authentication using GET /status.
+        No query parameters needed — simplest signed request to confirm tokens are correct.
+        """
+        self.print_info(f"Appliance URL: {self.base_url}")
+        self.print_info(f"SSL verify:    {'Yes' if self.verify_ssl else 'No (self-signed cert mode)'}")
+
+        success, data, msg = self._get("/status")
+
+        if success:
+            if isinstance(data, dict):
+                version = data.get("version", data.get("applianceVersion", ""))
+                label   = data.get("label", data.get("applianceLabel", ""))
+                if version:
+                    self.print_info(f"Appliance version: {version}")
+                if label:
+                    self.print_info(f"Appliance label:   {label}")
+            return (True, "Connected and authenticated — HMAC signing is working")
+        else:
+            if "Authentication error" in msg:
+                return (False,
+                    f"{msg}\n"
+                    "  • Both the Public Token AND Private Token must be correct\n"
+                    "  • The private token is case-sensitive — verify no truncation on copy/paste\n"
+                    "  • Tokens are created at: Threat Visualizer → Admin → System Config → API Token"
+                )
+            return (False, msg)
+
+    # -------------------------------------------------------------------------
+    # Test 3: AI Analyst alert access
+    # -------------------------------------------------------------------------
+
+    def test_ai_analyst(self) -> Tuple[bool, str, int]:
+        """
+        Test access to AI Analyst incident events (Elastic data stream: ai_analyst_alert).
+        Uses the exact parameters Elastic sends, querying the last 24 hours.
+        """
+        now_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ms = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
+
+        self.print_info("Querying AI Analyst incident events for the last 24 hours")
+
+        # Parameter names mirror what Elastic's httpjson input sends
+        params = {
+            "endtime":                 str(now_ms),
+            "includeacknowledged":     "true",
+            "includeincidenteventurl": "true",
+            "starttime":               str(start_ms),
+        }
+
+        success, data, msg = self._get("/aianalyst/incidentevents", params)
+
+        if success:
+            if isinstance(data, list):
+                count = len(data)
+            elif isinstance(data, dict):
+                count = len(data.get("events", data.get("incidentEvents", [])))
+            else:
+                count = 0
+            if count > 0:
+                return (True, f"Accessible — {count} AI Analyst event(s) in the last 24 hours", count)
+            else:
+                return (True, "Accessible — no AI Analyst events in last 24 hours (normal for quiet environments)", 0)
+        else:
+            return (False, msg, 0)
+
+    # -------------------------------------------------------------------------
+    # Test 4: Model breach alert access
+    # -------------------------------------------------------------------------
+
+    def test_model_breaches(self) -> Tuple[bool, str, int]:
+        """
+        Test access to model breach alerts (Elastic data stream: model_breach_alert).
+        Uses the exact parameters Elastic sends, querying the last 24 hours.
+        """
+        now_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ms = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
+
+        self.print_info("Querying model breach alerts for the last 24 hours")
+
+        # Parameter names mirror what Elastic's httpjson input sends
+        params = {
+            "endtime":             str(now_ms),
+            "expandenums":         "true",
+            "historicmodelonly":   "true",
+            "includeacknowledged": "true",
+            "includebreachurl":    "true",
+            "starttime":           str(start_ms),
+        }
+
+        success, data, msg = self._get("/modelbreaches", params)
+
+        if success:
+            count = len(data) if isinstance(data, list) else 0
+            if count > 0:
+                return (True, f"Accessible — {count} model breach(es) in the last 24 hours", count)
+            else:
+                return (True, "Accessible — no model breaches in last 24 hours (normal for quiet environments)", 0)
+        else:
+            return (False, msg, 0)
+
+    # -------------------------------------------------------------------------
+    # Orchestrator
+    # -------------------------------------------------------------------------
+
+    def run_validation(self) -> bool:
+        self.print_header("Darktrace API Credential Validator")
+        print(f"Appliance URL: {self.base_url}")
+        print(f"Testing at:    {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+
+        # Test 1: Format
+        self.print_header("Test 1: Credential Format Validation")
+        is_valid, errors = self.validate_input()
+        if is_valid:
+            self.print_success("Credential format is valid")
+        else:
+            self.print_error("Credential format validation failed:")
+            for err in errors:
+                print(f"  • {err}")
+            return False
+
+        # Test 2: Connectivity + auth
+        self.print_header("Test 2: Appliance Connectivity & HMAC Authentication")
+        success, msg = self.test_connectivity()
+        if success:
+            self.print_success(msg)
+        else:
+            self.print_error(msg)
+            print(f"\n{Color.RED}{Color.BOLD}STATUS: NOT READY - FIX REQUIRED{Color.END}\n")
+            return False
+
+        # Test 3: AI Analyst alerts
+        self.print_header("Test 3: AI Analyst Alert Access")
+        print("Elastic data stream: darktrace.ai_analyst_alert\n")
+        success, msg, _ = self.test_ai_analyst()
+        if success:
+            self.print_success(msg)
+            ai_ok = True
+        else:
+            self.print_error(msg)
+            print("\nCommon fixes:")
+            print("  • Confirm AI Analyst is licensed and enabled on this appliance")
+            print("  • Ensure the API token has read access to AI Analyst data")
+            ai_ok = False
+
+        # Test 4: Model breach alerts
+        self.print_header("Test 4: Model Breach Alert Access")
+        print("Elastic data stream: darktrace.model_breach_alert\n")
+        success, msg, _ = self.test_model_breaches()
+        if success:
+            self.print_success(msg)
+            breach_ok = True
+        else:
+            self.print_error(msg)
+            print("\nCommon fixes:")
+            print("  • Ensure the API token has read access to model breaches")
+            print("  • Verify the token was not created with restricted scope")
+            breach_ok = False
+
+        # Summary
+        self.print_header("Validation Summary")
+
+        results = [
+            ("AI Analyst Alerts",   ai_ok),
+            ("Model Breach Alerts", breach_ok),
+        ]
+
+        for name, ok in results:
+            icon = f"{Color.GREEN}✓ PASS{Color.END}" if ok else f"{Color.RED}✗ FAIL{Color.END}"
+            print(f"  {icon}  {name}")
+
+        print()
+        self.print_warning(
+            "System Status Alerts are NOT testable via REST — they require Syslog.\n"
+            "  Configure a Workflow Integration in Darktrace Threat Visualizer to forward\n"
+            "  JSON syslog to your Elastic Agent's IP on TCP port 9572 (or UDP port 9575)."
+        )
+        print()
+
+        required_ok = ai_ok and breach_ok
+
+        if required_ok:
+            self.print_success("All REST API data streams are accessible")
+            print(f"\n{Color.BOLD}Use these values in Elastic:{Color.END}")
+            print(f"  URL:           {self.base_url}")
+            print(f"  Public Token:  {self.public_token}")
+            print(f"  Private Token: [as provided]")
+            print()
+            self.print_info("The private token cannot be recovered from Darktrace after initial display.")
+            self.print_info("Store it in your password manager before closing the token dialog.")
+            print(f"\n{Color.GREEN}{Color.BOLD}STATUS: READY FOR ELASTIC INTEGRATION{Color.END}\n")
+            return True
+        else:
+            self.print_error("One or more data streams failed — fix before integrating")
+            print(f"\n{Color.RED}{Color.BOLD}STATUS: NOT READY - FIX REQUIRED{Color.END}\n")
+            return False
+
+
+def main():
+    print(f"{Color.BOLD}{Color.MAGENTA}")
+    print("╔════════════════════════════════════════════════════════════════════╗")
+    print("║     Darktrace API Credential Validator                            ║")
+    print("║     For Elastic Darktrace Integration                             ║")
+    print("╚════════════════════════════════════════════════════════════════════╝")
+    print(Color.END)
+
+    print(f"\n{Color.BOLD}Enter Darktrace credentials:{Color.END}\n")
+    print("  URL:           Your Darktrace Threat Visualizer address (IP or hostname)")
+    print("  Public Token:  Threat Visualizer → Admin → System Config → API Token")
+    print("  Private Token: Shown only once at token creation — cannot be retrieved later\n")
+
+    base_url      = input("Appliance URL (e.g. https://192.168.1.100): ").strip()
+    public_token  = input("Public Token:  ").strip()
+    private_token = input("Private Token: ").strip()
+
+    ssl_input  = input("\nSkip SSL verification? (for self-signed certs) [y/N]: ").strip().lower()
+    verify_ssl = ssl_input != "y"
+
+    validator = DarktraceValidator(base_url, public_token, private_token, verify_ssl)
+    success = validator.run_validation()
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
